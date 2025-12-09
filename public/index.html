@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>歩行空間ネットワーク可視化 (自動読み込み版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }
+        #map-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 0;
+        }
+        /* Canvas Overlay on top of Leaflet */
+        #networkCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none; /* Let clicks pass through to map */
+            z-index: 500; /* Above map tiles, below controls */
+        }
+        .panel {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(4px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        /* Custom scrollbar for panel */
+        .panel::-webkit-scrollbar {
+            width: 6px;
+        }
+        .panel::-webkit-scrollbar-thumb {
+            background-color: #ccc;
+            border-radius: 3px;
+        }
+        /* Loading Spinner */
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3b82f6;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="text-gray-800 font-sans">
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+    <!-- Control Panel -->
+    <div class="panel absolute top-4 left-4 w-80 p-4 rounded-xl z-[1000] flex flex-col gap-4 border border-gray-200">
+        <h1 class="text-lg font-bold text-gray-700 flex items-center gap-2">
+            <i class="fa-solid fa-map-location-dot text-blue-500"></i>
+            歩行空間ネットワーク
+        </h1>
+        
+        <div class="space-y-3">
+            <div id="status" class="text-xs text-gray-600 p-3 bg-gray-50 rounded border border-gray-200 whitespace-pre-wrap leading-relaxed">
+                <div class="flex items-center">
+                    <div class="spinner"></div> データを読み込み中...
+                </div>
+            </div>
+        </div>
+
+        <!-- View Mode Switcher -->
+        <div class="bg-gray-50 p-3 rounded-lg border border-gray-200">
+            <label class="block text-xs font-bold text-gray-700 mb-2">表示モード</label>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="radio" name="viewMode" value="type" checked class="text-blue-600" onchange="updateViewMode()">
+                    <span>リンク種別</span>
+                </label>
+                <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="radio" name="viewMode" value="transverse" class="text-red-600" onchange="updateViewMode()">
+                    <span>横断勾配</span>
+                </label>
+                <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="radio" name="viewMode" value="surface" class="text-amber-600" onchange="updateViewMode()">
+                    <span>路面状況</span>
+                </label>
+                <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="radio" name="viewMode" value="step" class="text-purple-600" onchange="updateViewMode()">
+                    <span>段差</span>
+                </label>
+            </div>
+        </div>
+
+        <!-- Legend (Dynamic) -->
+        <div id="legend" class="text-xs space-y-1">
+            <!-- Content will be updated by JS -->
+        </div>
+        
+        <div class="text-xs text-gray-400 mt-2">
+            データ: csv/node.csv, csv/link.csv<br>
+            背景: OpenStreetMap
+        </div>
+    </div>
+
+    <!-- Map & Canvas Container -->
+    <div id="map-container"></div>
+    <canvas id="networkCanvas"></canvas>
+
+    <!-- Tooltip -->
+    <div id="tooltip" class="absolute hidden bg-black bg-opacity-90 text-white text-xs p-3 rounded shadow-lg pointer-events-none z-[1100] whitespace-pre leading-relaxed border border-gray-700"></div>
+
+    <script>
+        // --- Configuration ---
+        const CONFIG = {
+            NODE_CSV_PATH: 'csv/node.csv',
+            LINK_CSV_PATH: 'csv/link.csv'
+        };
+
+        // --- State Management ---
+        const state = {
+            nodes: {}, // { id: { lat, lon } }
+            links: [], // [{ source, target, type, ... }]
+            loaded: { nodes: false, links: false },
+            viewMode: 'type' // 'type', 'transverse', 'surface', 'step'
+        };
+
+        const canvas = document.getElementById('networkCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const legendEl = document.getElementById('legend');
+        const tooltip = document.getElementById('tooltip');
+
+        // --- Leaflet Map Setup ---
+        const map = L.map('map-container', {
+            zoomControl: false, 
+            preferCanvas: true
+        }).setView([35.319, 139.550], 13); // Default view (Kamakura)
+
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(map);
+
+        // --- Initialization ---
+        window.addEventListener('DOMContentLoaded', initApp);
+
+        async function initApp() {
+            try {
+                // Fetch both CSVs in parallel
+                updateStatus("データをダウンロード中...", true);
+                
+                const [nodeText, linkText] = await Promise.all([
+                    fetchCSV(CONFIG.NODE_CSV_PATH),
+                    fetchCSV(CONFIG.LINK_CSV_PATH)
+                ]);
+
+                // Process Nodes
+                updateStatus("ノードデータを解析中...", true);
+                processNodes(nodeText);
+
+                // Process Links
+                updateStatus("リンクデータを解析中...", true);
+                processLinks(linkText);
+
+                // Finalize
+                if (state.loaded.nodes && state.loaded.links) {
+                    const nodeCount = Object.keys(state.nodes).length;
+                    const linkCount = state.links.length;
+                    updateStatus(`読み込み完了\nノード: ${nodeCount}件\nリンク: ${linkCount}件`, false);
+                    fitMapToContent();
+                    updateViewMode(); // Initial Draw
+                } else {
+                    updateStatus("データの一部読み込みに失敗しました。", false);
+                }
+
+            } catch (error) {
+                console.error(error);
+                updateStatus(`エラーが発生しました:\n${error.message}\n\ncsvフォルダとファイル名を確認してください。`, false);
+            }
+        }
+
+        // --- Status Helper ---
+        function updateStatus(msg, isLoading) {
+            if (isLoading) {
+                statusEl.innerHTML = `<div class="flex items-center"><div class="spinner"></div> ${msg.replace(/\n/g, '<br>')}</div>`;
+            } else {
+                statusEl.innerHTML = `<div class="font-bold text-gray-700">ステータス:</div>${msg.replace(/\n/g, '<br>')}`;
+            }
+        }
+
+        // --- Fetch & Decode Logic (Shift_JIS) ---
+        async function fetchCSV(path) {
+            const response = await fetch(path);
+            if (!response.ok) {
+                throw new Error(`ファイルの取得に失敗: ${path} (${response.status})`);
+            }
+            const buffer = await response.arrayBuffer();
+            const decoder = new TextDecoder('shift_jis');
+            return decoder.decode(buffer);
+        }
+
+        // --- Parsing Logic (Common) ---
+        function dmsToDecimal(dmsStr) {
+            if (!dmsStr) return null;
+            const cleanStr = dmsStr.replace(/"/g, '').trim(); 
+            const match = cleanStr.match(/(\d+)°\s*(\d+)'\s*([\d\.]+)/);
+            if (match) {
+                return parseFloat(match[1]) + (parseFloat(match[2]) / 60) + (parseFloat(match[3]) / 3600);
+            }
+            const simple = parseFloat(cleanStr);
+            return isNaN(simple) ? null : simple;
+        }
+
+        function parseCode(str) {
+            const f = parseFloat(str);
+            return isNaN(f) ? 0 : Math.round(f);
+        }
+
+        function parseCSVLines(text) {
+            return text.split(/\r\n|\n/).map(line => {
+                return line.split(',').map(c => {
+                    let val = c.trim();
+                    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+                    return val;
+                });
+            }).filter(row => row.length > 1);
+        }
+
+        // --- Data Processing ---
+        function processNodes(text) {
+            const rows = parseCSVLines(text);
+            state.nodes = {};
+            
+            rows.forEach((row, index) => {
+                if (row.length < 4) return;
+                if (isNaN(parseInt(row[0])) && index < 5) return; // Skip header
+
+                const id = row[0];
+                const lat = dmsToDecimal(row[2]);
+                const lon = dmsToDecimal(row[3]);
+
+                if (lat && lon && lat > 20 && lat < 50 && lon > 120 && lon < 150) {
+                    state.nodes[id] = { id, lat, lon };
+                }
+            });
+            state.loaded.nodes = true;
+        }
+
+        function processLinks(text) {
+            const rows = parseCSVLines(text);
+            state.links = [];
+
+            rows.forEach((row, index) => {
+                if (row.length < 4) return;
+                if (isNaN(parseInt(row[0])) && index < 5) return; // Skip header
+
+                const linkId = row[0];
+                const startId = row[1];
+                const endId = row[2];
+
+                if(linkId && startId && endId) {
+                    state.links.push({
+                        id: linkId,
+                        source: startId,
+                        target: endId,
+                        type: parseCode(row[3]),
+                        width: parseCode(row[4]),
+                        longGrad: parseCode(row[5]),
+                        transGrad: parseCode(row[6]),
+                        surface: parseCode(row[7]),
+                        step: parseCode(row[8])
+                    });
+                }
+            });
+            state.loaded.links = true;
+        }
+
+        // --- Map & View Logic ---
+        function fitMapToContent() {
+            if (Object.keys(state.nodes).length === 0) return;
+            const bounds = L.latLngBounds([]);
+            for (const id in state.nodes) {
+                const n = state.nodes[id];
+                bounds.extend([n.lat, n.lon]);
+            }
+            map.fitBounds(bounds, { padding: [50, 50] });
+        }
+
+        function updateViewMode() {
+            const radios = document.getElementsByName('viewMode');
+            for(const r of radios) {
+                if(r.checked) state.viewMode = r.value;
+            }
+            updateLegend();
+            draw();
+        }
+
+        function updateLegend() {
+            let html = '<div class="font-bold text-gray-600 mb-1">凡例:</div>';
+            
+            if (state.viewMode === 'type') {
+                html += `
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-600"></span> 1: 歩車分離あり</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-red-600"></span> 2: 歩車分離なし</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-green-600"></span> 3: 動く歩道等</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-purple-600"></span> 4-8: その他/特殊</div>
+                `;
+            } else if (state.viewMode === 'transverse') {
+                html += `
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-600"></span> 1: 問題なし (2.5%未満)</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-yellow-500"></span> 2: 多少あり (2.5-5%)</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-red-600"></span> 3: 問題あり (5%以上)</div>
+                `;
+            } else if (state.viewMode === 'surface') {
+                html += `
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-600"></span> 1: 問題なし (舗装等)</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-red-600"></span> 2: 問題あり (砂利・不陸)</div>
+                `;
+            } else if (state.viewMode === 'step') {
+                html += `
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-600"></span> 1: 問題なし (2cm以下)</div>
+                    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-red-600"></span> 2: 問題あり (2cm超)</div>
+                `;
+            }
+            html += `<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-gray-400"></span> データなし/不明</div>`;
+            legendEl.innerHTML = html;
+        }
+
+        // --- Canvas Drawing Logic ---
+        function getLinkColor(link) {
+            const gray = '#9ca3af';
+            if (state.viewMode === 'transverse') {
+                if(link.transGrad === 1) return '#2563eb';
+                if(link.transGrad === 2) return '#eab308';
+                if(link.transGrad === 3) return '#dc2626';
+                return gray;
+            } else if (state.viewMode === 'surface') {
+                if(link.surface === 1) return '#2563eb';
+                if(link.surface === 2) return '#dc2626';
+                return gray;
+            } else if (state.viewMode === 'step') {
+                if(link.step === 1) return '#2563eb';
+                if(link.step === 2) return '#dc2626';
+                return gray;
+            } else {
+                switch (link.type) {
+                    case 1: return '#2563eb';
+                    case 2: return '#dc2626';
+                    case 3: return '#16a34a';
+                    case 4: case 5: case 6: case 7: case 8: return '#9333ea';
+                    default: return gray;
+                }
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (!state.loaded.nodes) return;
+
+            const mapBounds = map.getBounds();
+            const zoom = map.getZoom();
+            const lineWidth = Math.max(1.5, (zoom - 12) * 0.8);
+            ctx.lineWidth = lineWidth;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+
+            state.links.forEach(link => {
+                const sNode = state.nodes[link.source];
+                const tNode = state.nodes[link.target];
+                if (sNode && tNode) {
+                    // Optimization: Check if at least one node is roughly in view? 
+                    // For small datasets, skipping this check avoids flickering at edges.
+                    const p1 = map.latLngToContainerPoint([sNode.lat, sNode.lon]);
+                    const p2 = map.latLngToContainerPoint([tNode.lat, tNode.lon]);
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.strokeStyle = getLinkColor(link);
+                    ctx.stroke();
+                }
+            });
+
+            if (zoom >= 15) {
+                const radius = Math.max(1, (zoom - 14) * 0.8);
+                ctx.fillStyle = 'rgba(50, 50, 50, 0.6)';
+                for (const id in state.nodes) {
+                    const n = state.nodes[id];
+                    if (!mapBounds.contains([n.lat, n.lon])) continue;
+                    const p = map.latLngToContainerPoint([n.lat, n.lon]);
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+        }
+
+        function resizeCanvas() {
+            const size = map.getSize();
+            canvas.width = size.x;
+            canvas.height = size.y;
+            draw();
+        }
+
+        map.on('move', draw);     
+        map.on('zoom', draw);     
+        map.on('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- Interaction ---
+        map.on('mousemove', (e) => {
+            if (!state.loaded.nodes) return;
+            
+            const mouseLatLng = e.latlng;
+            const mousePoint = map.latLngToContainerPoint(mouseLatLng);
+            const zoom = map.getZoom();
+
+            let nearestNode = null;
+            let minDistNode = 10; 
+
+            if (zoom > 14) {
+                 for (const id in state.nodes) {
+                    const n = state.nodes[id];
+                    if (Math.abs(n.lat - mouseLatLng.lat) > 0.0005 || Math.abs(n.lon - mouseLatLng.lng) > 0.0005) continue;
+                    const p = map.latLngToContainerPoint([n.lat, n.lon]);
+                    const dist = Math.hypot(p.x - mousePoint.x, p.y - mousePoint.y);
+                    if (dist < minDistNode) {
+                        minDistNode = dist;
+                        nearestNode = n;
+                    }
+                }
+            }
+
+            let nearestLink = null;
+            let minDistLink = 6; 
+
+            if (!nearestNode) {
+                state.links.forEach(link => {
+                    const s = state.nodes[link.source];
+                    const t = state.nodes[link.target];
+                    if (!s || !t) return;
+                    const minLat = Math.min(s.lat, t.lat) - 0.0005;
+                    const maxLat = Math.max(s.lat, t.lat) + 0.0005;
+                    const minLon = Math.min(s.lon, t.lon) - 0.0005;
+                    const maxLon = Math.max(s.lon, t.lon) + 0.0005;
+                    if (mouseLatLng.lat < minLat || mouseLatLng.lat > maxLat || mouseLatLng.lng < minLon || mouseLatLng.lng > maxLon) return;
+
+                    const p1 = map.latLngToContainerPoint([s.lat, s.lon]);
+                    const p2 = map.latLngToContainerPoint([t.lat, t.lon]);
+
+                    const A = mousePoint.x - p1.x;
+                    const B = mousePoint.y - p1.y;
+                    const C = p2.x - p1.x;
+                    const D = p2.y - p1.y;
+                    const dot = A * C + B * D;
+                    const lenSq = C * C + D * D;
+                    let param = -1;
+                    if (lenSq !== 0) param = dot / lenSq;
+                    let xx, yy;
+                    if (param < 0) { xx = p1.x; yy = p1.y; }
+                    else if (param > 1) { xx = p2.x; yy = p2.y; }
+                    else { xx = p1.x + param * C; yy = p1.y + param * D; }
+                    
+                    const dist = Math.hypot(mousePoint.x - xx, mousePoint.y - yy);
+                    if (dist < minDistLink) {
+                        minDistLink = dist;
+                        nearestLink = link;
+                    }
+                });
+            }
+
+            if (nearestNode) {
+                tooltip.style.display = 'block';
+                tooltip.style.left = (e.originalEvent.clientX + 10) + 'px';
+                tooltip.style.top = (e.originalEvent.clientY + 10) + 'px';
+                tooltip.innerHTML = `<span class="text-blue-300 font-bold">Node</span><br>ID: ${nearestNode.id}<br>Lat: ${nearestNode.lat.toFixed(6)}<br>Lon: ${nearestNode.lon.toFixed(6)}`;
+            } else if (nearestLink) {
+                tooltip.style.display = 'block';
+                tooltip.style.left = (e.originalEvent.clientX + 10) + 'px';
+                tooltip.style.top = (e.originalEvent.clientY + 10) + 'px';
+                const typeMap = {1:"分離あり", 2:"分離なし", 3:"動く歩道", 4:"踏切", 5:"エレベーター", 6:"階段", 7:"スロープ", 8:"その他"};
+                const surfaceMap = {1:"問題なし", 2:"問題あり(砂利等)"};
+                const stepMap = {1:"問題なし(2cm以下)", 2:"問題あり(2cm超)"};
+                tooltip.innerHTML = `<span class="text-green-300 font-bold">Link</span><br>ID: ${nearestLink.id}<br>種別: ${typeMap[nearestLink.type] || '不明'}<br>横断勾配: ${nearestLink.transGrad === 1 ? 'なし' : (nearestLink.transGrad === 2 ? '多少' : 'あり')}<br>路面: ${surfaceMap[nearestLink.surface] || '不明'}<br>段差: ${stepMap[nearestLink.step] || '不明'}`;
+            } else {
+                tooltip.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>
